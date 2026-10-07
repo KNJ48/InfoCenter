@@ -1,0 +1,16 @@
+{
+  "name": "information-center",
+  "version": "1.0.0",
+  "description": "Application-agnostic volatile memory and realtime communication relay",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "ws": "^8.18.3"
+  }
+}
