@@ -413,7 +413,7 @@ app.get("/health", (req, res) => {
 // ---------------------------
 
 // MEM
-app.put(/^\\/c(?:\\/.*)?$/, getRawBody, (req, res) => {
+app.put(/^\/c(?:\/.*)?$/, getRawBody, (req, res) => {
   const space = spaceFromRequest(req);
 
   // Bufferとして保存する。
@@ -424,7 +424,7 @@ app.put(/^\\/c(?:\\/.*)?$/, getRawBody, (req, res) => {
 
 
 // DoGET
-app.get(/^\\/c(?:\\/.*)?$/, (req, res) => {
+app.get(/^\/c(?:\/.*)?$/, (req, res) => {
   const space = spaceFromRequest(req);
 
   const data = memory.get(space);
@@ -442,7 +442,7 @@ app.get(/^\\/c(?:\\/.*)?$/, (req, res) => {
 
 
 // DoPOST
-app.post(/^\\/c(?:\\/.*)?$/, getRawBody, (req, res) => {
+app.post(/^\/c(?:\/.*)?$/, getRawBody, (req, res) => {
   const space = spaceFromRequest(req);
   const body = req.rawBody;
 
