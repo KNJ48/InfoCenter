@@ -157,97 +157,113 @@
      *
      * 注意: キーの有無にかかわらずPromiseを返します。
      */
-    connect(identifier, key) {
-      this.headersFor(key);
+connect(identifier, key) {
+  this.headersFor(key);
 
-      const url = this.wsUrlFor(identifier);
+  const url = this.wsUrlFor(identifier);
+  const hasKey = key !== undefined && key !== null;
 
-      return new Promise((resolve, reject) => {
-        const ws = new WebSocket(url);
-        let settled = false;
+  return new Promise((resolve, reject) => {
+    // キー付き接続では、秘密を送る前に
+    // 「キー付き空間に接続したい」とサーバーへ伝える。
+    const ws = hasKey
+      ? new WebSocket(url, "ic-key-v2")
+      : new WebSocket(url);
 
-        const timer = setTimeout(() => {
-          fail("WebSocket接続または認証がタイムアウトしました");
-        }, 15000);
+    let settled = false;
 
-        function cleanup() {
-          clearTimeout(timer);
-          ws.removeEventListener("open", onOpen);
-          ws.removeEventListener("message", onMessage);
-          ws.removeEventListener("error", onError);
-          ws.removeEventListener("close", onClose);
-        }
+    const timer = setTimeout(() => {
+      fail("WebSocket接続または認証がタイムアウトしました");
+    }, 15000);
 
-        function succeed() {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          resolve(ws);
-        }
-
-        function fail(message) {
-          if (settled) return;
-          settled = true;
-          cleanup();
-
-          if (
-            ws.readyState === WebSocket.CONNECTING ||
-            ws.readyState === WebSocket.OPEN
-          ) {
-            ws.close();
-          }
-
-          reject(new Error(message));
-        }
-
-        function onOpen() {
-          if (key === undefined || key === null) {
-            succeed();
-            return;
-          }
-
-          ws.send(JSON.stringify({
-            type: "auth",
-            key
-          }));
-        }
-
-        function onMessage(event) {
-          if (typeof event.data !== "string") {
-            fail("認証応答が不正です");
-            return;
-          }
-
-          try {
-            const message = JSON.parse(event.data);
-
-            if (message.type === "auth_ok") {
-              succeed();
-            } else {
-              fail("認証応答が不正です");
-            }
-          } catch {
-            fail("認証応答が不正です");
-          }
-        }
-
-        function onError() {
-          fail("WebSocket接続エラー");
-        }
-
-        function onClose(event) {
-          fail(
-            `WebSocketが切断されました: ${event.code} ${event.reason}`
-          );
-        }
-
-        ws.addEventListener("open", onOpen);
-        ws.addEventListener("message", onMessage);
-        ws.addEventListener("error", onError);
-        ws.addEventListener("close", onClose);
-      });
+    function cleanup() {
+      clearTimeout(timer);
+      ws.removeEventListener("open", onOpen);
+      ws.removeEventListener("message", onMessage);
+      ws.removeEventListener("error", onError);
+      ws.removeEventListener("close", onClose);
     }
-  }
+
+    function succeed() {
+      if (settled) return;
+
+      settled = true;
+      cleanup();
+      resolve(ws);
+    }
+
+    function fail(message) {
+      if (settled) return;
+
+      settled = true;
+      cleanup();
+
+      if (
+        ws.readyState === WebSocket.CONNECTING ||
+        ws.readyState === WebSocket.OPEN
+      ) {
+        ws.close();
+      }
+
+      reject(new Error(message));
+    }
+
+    function onOpen() {
+      if (!hasKey) {
+        // サーバーが公開空間として接続を許可した。
+        succeed();
+        return;
+      }
+
+      if (ws.protocol !== "ic-key-v2") {
+        fail("キー付き接続に対応していないサーバーです");
+        return;
+      }
+
+      // ここで初めてキーを送る。
+      ws.send(JSON.stringify({
+        type: "auth",
+        key
+      }));
+    }
+
+    function onMessage(event) {
+      if (typeof event.data !== "string") {
+        fail("認証応答が不正です");
+        return;
+      }
+
+      try {
+        const message = JSON.parse(event.data);
+
+        if (message.type === "auth_ok") {
+          succeed();
+        } else {
+          fail("認証応答が不正です");
+        }
+      } catch {
+        fail("認証応答が不正です");
+      }
+    }
+
+    function onError() {
+      fail(
+        "WebSocket接続が拒否されました。キーの要否や登録状態を確認してください"
+      );
+    }
+
+    function onClose(event) {
+      fail(
+        `WebSocketが切断されました: ${event.code} ${event.reason}`
+      );
+    }
+
+    ws.addEventListener("open", onOpen);
+    ws.addEventListener("message", onMessage);
+    ws.addEventListener("error", onError);
+    ws.addEventListener("close", onClose);
+  });
+}
 
   global.InformationCenter = InformationCenter;
 })(globalThis);
