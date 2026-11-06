@@ -10,9 +10,12 @@ const server = http.createServer(app);
 
 const PORT = Number(process.env.PORT) || 3000;
 
-// 制限値
-const MAX_BODY_SIZE = 1024 * 1024;       // 1 MiB
-const MAX_MEMORY_TOTAL = 32 * 1024 * 1024; // MEM合計 32 MiB
+// --------------------------------------------------
+// 制限
+// --------------------------------------------------
+
+const MAX_BODY_SIZE = 1024 * 1024;
+const MAX_MEMORY_TOTAL = 32 * 1024 * 1024;
 const MAX_SPACES = 5000;
 const MAX_IDENTIFIER_BYTES = 512;
 const MAX_KEY_BYTES = 512;
@@ -20,11 +23,11 @@ const AUTH_TIMEOUT_MS = 5000;
 const MAX_WS_CLIENTS = 500;
 const MAX_WS_BUFFERED = 4 * 1024 * 1024;
 
-// path + query → { keyHash: Buffer | null }
-// null はキーなしの公開空間。
+// path + query -> { keyHash: Buffer | null }
+// keyHash が null なら公開空間。
 const spaces = new Map();
 
-// path + query → Buffer
+// path + query -> Buffer
 const memory = new Map();
 let totalMemoryBytes = 0;
 
@@ -74,15 +77,22 @@ function hashKey(key) {
 }
 
 function keyMatches(storedHash, candidate) {
-  if (!validateKey(candidate)) return false;
+  if (!validateKey(candidate)) {
+    return false;
+  }
 
   const candidateHash = hashKey(candidate);
   return crypto.timingSafeEqual(storedHash, candidateHash);
 }
 
 function createPublicSpaceIfNeeded(space) {
-  if (spaces.has(space)) return true;
-  if (spaces.size >= MAX_SPACES) return false;
+  if (spaces.has(space)) {
+    return true;
+  }
+
+  if (spaces.size >= MAX_SPACES) {
+    return false;
+  }
 
   spaces.set(space, { keyHash: null });
   return true;
@@ -93,16 +103,20 @@ function authorizeHttp(req, res) {
   const key = req.get("X-Information-Center-Key");
   let record = spaces.get(space);
 
-  // キーを持っているのに登録がない場合は、
-  // 公開空間を作らず拒否する。
   if (!record) {
+    // キー付きで使うつもりなら、未登録空間を
+    // 自動的に公開空間として作らず拒否する。
     if (key !== undefined) {
-      res.status(403).json({ error: "PROTECTED_SPACE_NOT_REGISTERED" });
+      res.status(403).json({
+        error: "PROTECTED_SPACE_NOT_REGISTERED"
+      });
       return null;
     }
 
     if (!createPublicSpaceIfNeeded(space)) {
-      res.status(503).json({ error: "SPACE_LIMIT_REACHED" });
+      res.status(503).json({
+        error: "SPACE_LIMIT_REACHED"
+      });
       return null;
     }
 
@@ -110,31 +124,18 @@ function authorizeHttp(req, res) {
   }
 
   if (record.keyHash === null) {
-    // キー付きで使うつもりのクライアントを、
-    // 意図せず公開空間に入れない。
+    // キー付きのつもりで公開空間を使わせない。
     if (key !== undefined) {
-      res.status(403).json({ error: "SPACE_IS_PUBLIC" });
+      res.status(403).json({
+        error: "SPACE_IS_PUBLIC"
+      });
       return null;
     }
-  } else {
-    if (!keyMatches(record.keyHash, key)) {
-      res.status(403).json({ error: "INVALID_KEY" });
-      return null;
-    }
-  }
-
-  return space;
-}
-
-  const record = spaces.get(space);
-
-  if (record.keyHash !== null) {
-    const key = req.get("X-Information-Center-Key");
-
-    if (!keyMatches(record.keyHash, key)) {
-      res.status(403).json({ error: "INVALID_KEY" });
-      return null;
-    }
+  } else if (!keyMatches(record.keyHash, key)) {
+    res.status(403).json({
+      error: "INVALID_KEY"
+    });
+    return null;
   }
 
   return space;
@@ -153,7 +154,6 @@ function broadcast(space, data, isBinary, excludedClient = null) {
       continue;
     }
 
-    // 遅い接続に無制限にデータを溜めない。
     if (client.bufferedAmount > MAX_WS_BUFFERED) {
       client.close(1013, "Client too slow");
       continue;
@@ -170,18 +170,23 @@ function broadcast(space, data, isBinary, excludedClient = null) {
   return delivered;
 }
 
+// --------------------------------------------------
+// CORS・キャッシュ
+// --------------------------------------------------
+
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
+
   res.setHeader(
     "Access-Control-Allow-Methods",
     "GET, POST, PUT, OPTIONS"
   );
+
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Content-Type, X-Information-Center-Key"
   );
 
-  // MEMは一時データなので、古いHTTPキャッシュを返さない。
   res.setHeader("Cache-Control", "no-store");
 
   if (req.method === "OPTIONS") {
@@ -203,10 +208,24 @@ app.get("/", (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Information Center</title>
 <style>
-  body { max-width: 900px; margin: 40px auto; padding: 0 16px 60px;
-         font-family: system-ui, sans-serif; line-height: 1.6; }
-  pre { padding: 14px; background: #eee; overflow-x: auto; }
-  .warning { background: #fff4d6; padding: 14px; }
+  body {
+    max-width: 900px;
+    margin: 40px auto;
+    padding: 0 16px 60px;
+    font-family: system-ui, sans-serif;
+    line-height: 1.6;
+  }
+
+  pre {
+    padding: 14px;
+    background: #eee;
+    overflow-x: auto;
+  }
+
+  .warning {
+    background: #fff4d6;
+    padding: 14px;
+  }
 </style>
 </head>
 <body>
@@ -214,7 +233,7 @@ app.get("/", (req, res) => {
 
 <p>
 汎用通信センターです。本文の形式や意味は解釈しません。
-識別子が同じクライアント同士で通信できます。
+同じ識別子を使うクライアント同士で通信できます。
 </p>
 
 <h2>JavaScriptクライアント</h2>
@@ -222,26 +241,27 @@ app.get("/", (req, res) => {
 <pre>&lt;script src="https://infocenter-e7ok.onrender.com/information-center.js"&gt;&lt;/script&gt;</pre>
 
 <pre>
-// このサーバーに接続
 const center = new InformationCenter(
   "https://infocenter-e7ok.onrender.com"
 );
 
-// 識別子と任意のキー
 const id = "my-game-room";
-const key = "十分長いランダムな秘密キー";
 
-// 初めて使う前に一度だけ登録。
+// 半角英数字、ハイフン、アンダースコアを使う。
+// 実際には十分長いランダムなキーを生成すること。
+const key = "example_random_key_replace_this";
+
+// 初めて使う前に一度だけ登録する。
 // 既に登録・使用済みなら失敗する。
 await center.register(id, key);
 
-// MEM: RAMに保存
+// RAMに保存。既存の値は上書きされる。
 await center.mem(id, "保存する内容", key);
 
-// DoGET: MEMを読む。なければnull
+// 保存された値を読む。なければnull。
 console.log(await center.getText(id, key));
 
-// WebSocket: 接続と認証が完了してから返る
+// 接続・認証が完了してからWebSocketを返す。
 const ws = await center.connect(id, key);
 
 ws.onmessage = async event => {
@@ -259,8 +279,8 @@ await center.post(id, "HTTPからこんにちは", key);
 </pre>
 
 <p>
-キーなしで使う場合は register を呼ばず、各メソッドの
-key 引数を省略してください。
+キーなしで使う場合は register を呼ばず、
+各メソッドの key 引数を省略してください。
 </p>
 
 <h2>識別子の変換規則</h2>
@@ -268,8 +288,8 @@ key 引数を省略してください。
 <pre>UTF-8 → Base64URL（末尾の = なし）→ /c/id/{結果}</pre>
 
 <p>
-文字列は正確に一致させてください。大文字・小文字、空白、
-Unicodeの表現の違いも区別します。
+大文字・小文字、空白、Unicodeの表現の違いも区別します。
+同じ識別子を使用してください。
 </p>
 
 <h2>HTTP API</h2>
@@ -277,13 +297,13 @@ Unicodeの表現の違いも区別します。
 <pre>
 POST /register
   JSON: {"identifier":"識別子","key":"秘密キー"}
-  新しいキー付き空間を登録。成功: 201、使用済み: 409
+  成功: 201 / 既に使用済み: 409
 
 PUT /c/...   MEMを上書き保存
-GET /c/...   MEMを取得。存在しなければ404
-POST /c/...  接続中のWebSocketへ配信
+GET /c/...   MEMを取得。なければ404
+POST /c/...  WebSocket接続者へ配信
 
-キー付き空間へのHTTP通信:
+キー付き空間:
   X-Information-Center-Key ヘッダーにキーを指定
 </pre>
 
@@ -291,36 +311,46 @@ POST /c/...  接続中のWebSocketへ配信
 
 <pre>
 公開空間:
-  wss://HOST/c/... に接続するだけ
+  wss://HOST/c/... に接続する
 
 キー付き空間:
-  接続後、最初の5秒以内に次のJSONテキストを送信:
+  WebSocketサブプロトコルとして "ic-key-v2" を指定。
+  接続後、最初の5秒以内にJSONテキストを送る:
+
   {"type":"auth","key":"秘密キー"}
 
-  サーバーが {"type":"auth_ok"} を返せば認証成功。
-  以降のメッセージは同じ空間の他の接続へ転送。
+  {"type":"auth_ok"} が返れば認証成功。
+  それ以降のメッセージが配信される。
 </pre>
 
 <p>
 HTTP POSTの本文はWebSocketへバイナリとして配信されます。
-WebSocketからの送信は元のテキスト／バイナリ種別を維持します。
+WebSocketからの送信はテキスト／バイナリの種別を維持します。
 送信元WebSocketには自分のメッセージは返りません。
 </p>
 
+<h2>保存とセキュリティ</h2>
+
 <div class="warning">
-<strong>注意：</strong>
-登録情報とMEMはRAMのみです。スリープ、再起動、
-再デプロイ等で消えます。再起動後は他者が先に識別子を
-取得できる可能性があります。センターは本文を読めるため、
-センターからも隠したい場合はクライアント側で別途暗号化してください。
-キーを公開HTMLに埋め込むと閲覧者にも見えます。
+登録情報とMEMはRAMのみです。スリープ・再起動・再デプロイ等で
+消えます。再起動後は他者が先に識別子を使える可能性があります。
+
+センターは本文を読めるため、センターからも隠したい場合は
+クライアント側で別途暗号化してください。
+
+共有キーを知っている人は読み書きできます。
+公開HTMLにキーを埋め込むと閲覧者にも見えます。
+
+このサーバーにはレート制限がありません。
+重要なデータを守る用途には使用しないでください。
 </div>
 
 <h2>V1互換</h2>
+
 <p>
 キーなし空間では、従来どおり /c/... に直接アクセスできます。
-ただし、先に公開空間として使われたURLは、再起動まで
-キー付きとして登録できません。
+先に公開空間として使われたURLは、再起動までキー付きとして
+登録できません。
 </p>
 
 <p>
@@ -328,6 +358,7 @@ WebSocketからの送信は元のテキスト／バイナリ種別を維持し�
 <a href="/health">稼働状況 /health</a> |
 <a href="/information-center.js">クライアントライブラリ</a>
 </p>
+
 </body>
 </html>`);
 });
@@ -337,39 +368,55 @@ app.get("/spec", (req, res) => {
     name: "Information Center",
     version: "2.0-ram-key",
     bodyPolicy: "opaque bytes",
-    identifierMapping: "UTF-8 -> Base64URL without padding -> /c/id/{encoded}",
+    identifierMapping:
+      "UTF-8 -> Base64URL without padding -> /c/id/{encoded}",
     clientLibrary: "/information-center.js",
+
     registration: {
       method: "POST",
       path: "/register",
-      json: { identifier: "non-empty string", key: "non-empty string" },
+      json: {
+        identifier: "non-empty string",
+        key: "non-empty string"
+      },
       success: 201,
       alreadyUsed: 409,
       storage: "volatile process RAM"
     },
+
     http: {
       mem: "PUT /c/...",
       get: "GET /c/...",
       post: "POST /c/...",
       keyHeader: "X-Information-Center-Key"
     },
+
     websocket: {
       path: "/c/...",
       protectedAuth: {
-        firstMessage: { type: "auth", key: "secret" },
-        success: { type: "auth_ok" },
+        subprotocol: "ic-key-v2",
+        firstMessage: {
+          type: "auth",
+          key: "secret"
+        },
+        success: {
+          type: "auth_ok"
+        },
         timeoutMs: AUTH_TIMEOUT_MS
       },
       senderReceivesOwnMessage: false
     },
+
     warnings: [
-      "Registration and MEM may disappear on sleep, restart, or deployment.",
+      "Registration and MEM can disappear on sleep, restart, or deployment.",
       "Register protected identifiers before first use.",
       "The server can read bodies and keys.",
       "A shared key grants both read and write access.",
       "Public identifiers can be used by anyone.",
-      "This implementation is for a single server instance."
+      "This implementation is for a single server instance.",
+      "There is no rate limit or brute-force protection."
     ],
+
     limits: {
       maxBodyBytes: MAX_BODY_SIZE,
       maxMemoryBytes: MAX_MEMORY_TOTAL,
@@ -394,7 +441,9 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/information-center.js", (req, res) => {
-  res.sendFile("information-center.js", { root: __dirname });
+  res.sendFile("information-center.js", {
+    root: __dirname
+  });
 });
 
 // --------------------------------------------------
@@ -425,8 +474,6 @@ app.post(
       });
     }
 
-    // 登録判定とセットは同期処理なので、このプロセス内では
-    // 途中に他リクエストが割り込まない。
     if (spaces.has(space)) {
       return res.status(409).json({
         error: "SPACE_ALREADY_USED"
@@ -439,7 +486,9 @@ app.post(
       });
     }
 
-    spaces.set(space, { keyHash: hashKey(key) });
+    spaces.set(space, {
+      keyHash: hashKey(key)
+    });
 
     return res.status(201).json({
       ok: true,
@@ -457,16 +506,22 @@ const rawBody = express.raw({
   limit: MAX_BODY_SIZE
 });
 
-// 認証後に本文を読み取る。
 app.use((req, res, next) => {
-  if (!isCommunicationPath(req)) return next();
+  if (!isCommunicationPath(req)) {
+    return next();
+  }
 
   if (!["GET", "PUT", "POST"].includes(req.method)) {
-    return res.status(405).json({ error: "METHOD_NOT_ALLOWED" });
+    return res.status(405).json({
+      error: "METHOD_NOT_ALLOWED"
+    });
   }
 
   const space = authorizeHttp(req, res);
-  if (space === null) return;
+
+  if (space === null) {
+    return;
+  }
 
   req.communicationSpace = space;
   next();
@@ -475,14 +530,19 @@ app.use((req, res, next) => {
 // MEM
 app.put(/^\/c(?:\/.*)?$/, rawBody, (req, res) => {
   const space = req.communicationSpace;
-  const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+
+  const body = Buffer.isBuffer(req.body)
+    ? req.body
+    : Buffer.alloc(0);
 
   const previous = memory.get(space);
   const previousSize = previous ? previous.length : 0;
   const nextTotal = totalMemoryBytes - previousSize + body.length;
 
   if (nextTotal > MAX_MEMORY_TOTAL) {
-    return res.status(503).json({ error: "MEMORY_LIMIT_REACHED" });
+    return res.status(503).json({
+      error: "MEMORY_LIMIT_REACHED"
+    });
   }
 
   memory.set(space, Buffer.from(body));
@@ -496,7 +556,9 @@ app.get(/^\/c(?:\/.*)?$/, (req, res) => {
   const data = memory.get(req.communicationSpace);
 
   if (data === undefined) {
-    return res.status(404).json({ error: "NO_MEMORY" });
+    return res.status(404).json({
+      error: "NO_MEMORY"
+    });
   }
 
   res.type("application/octet-stream").send(data);
@@ -504,7 +566,9 @@ app.get(/^\/c(?:\/.*)?$/, (req, res) => {
 
 // DoPOST
 app.post(/^\/c(?:\/.*)?$/, rawBody, (req, res) => {
-  const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+  const body = Buffer.isBuffer(req.body)
+    ? req.body
+    : Buffer.alloc(0);
 
   const delivered = broadcast(
     req.communicationSpace,
@@ -512,7 +576,10 @@ app.post(/^\/c(?:\/.*)?$/, rawBody, (req, res) => {
     true
   );
 
-  res.json({ ok: true, delivered });
+  res.json({
+    ok: true,
+    delivered
+  });
 });
 
 // --------------------------------------------------
@@ -525,6 +592,7 @@ server.on("upgrade", (req, socket, head) => {
       `HTTP/1.1 ${status} ${reason}\r\n` +
       "Connection: close\r\n\r\n"
     );
+
     socket.destroy();
   }
 
@@ -538,8 +606,7 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  // このマーカーは秘密キーではない。
-  // 「キー付き空間に接続したい」という意思表示。
+  // 秘密キーそのものではなく、接続方式を示す目印。
   const protocols = (req.headers["sec-websocket-protocol"] || "")
     .split(",")
     .map(value => value.trim());
@@ -550,7 +617,6 @@ server.on("upgrade", (req, socket, head) => {
 
   if (!record) {
     if (wantsProtected) {
-      // 登録が消えていた場合、公開空間にフォールバックしない。
       rejectUpgrade(403, "Protected Space Not Registered");
       return;
     }
@@ -565,7 +631,6 @@ server.on("upgrade", (req, socket, head) => {
 
   const isProtected = record.keyHash !== null;
 
-  // 接続したい種類と、実際の空間の種類が違えば拒否。
   if (wantsProtected !== isProtected) {
     rejectUpgrade(403, "Space Type Mismatch");
     return;
@@ -593,7 +658,6 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (data, isBinary) => {
     if (!ws.authenticated) {
-      // 最初のメッセージは認証専用。
       if (isBinary || data.length > 4096) {
         ws.close(1008, "Invalid authentication");
         return;
@@ -619,7 +683,10 @@ wss.on("connection", (ws) => {
       ws.authenticated = true;
       clearTimeout(authTimer);
 
-      ws.send(JSON.stringify({ type: "auth_ok" }));
+      ws.send(JSON.stringify({
+        type: "auth_ok"
+      }));
+
       return;
     }
 
@@ -627,7 +694,9 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    if (authTimer) clearTimeout(authTimer);
+    if (authTimer) {
+      clearTimeout(authTimer);
+    }
   });
 
   ws.on("error", (error) => {
@@ -640,19 +709,32 @@ wss.on("connection", (ws) => {
 // --------------------------------------------------
 
 app.use((err, req, res, next) => {
-  if (res.headersSent) return next(err);
+  if (res.headersSent) {
+    return next(err);
+  }
 
   if (err.type === "entity.too.large") {
-    return res.status(413).json({ error: "BODY_TOO_LARGE" });
+    return res.status(413).json({
+      error: "BODY_TOO_LARGE"
+    });
   }
 
   if (err.type === "entity.parse.failed") {
-    return res.status(400).json({ error: "INVALID_JSON" });
+    return res.status(400).json({
+      error: "INVALID_JSON"
+    });
   }
 
   console.error(err);
-  res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
+
+  res.status(500).json({
+    error: "INTERNAL_SERVER_ERROR"
+  });
 });
+
+// --------------------------------------------------
+// 起動
+// --------------------------------------------------
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Information Center running on port ${PORT}`);
