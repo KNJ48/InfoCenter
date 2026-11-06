@@ -265,5 +265,7 @@ connect(identifier, key) {
   });
 }
 
-  global.InformationCenter = InformationCenter;
+} // InformationCenterクラスを閉じる
+
+global.InformationCenter = InformationCenter;
 })(globalThis);
