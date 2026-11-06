@@ -325,7 +325,45 @@ V1 intentionally provides no application-level users, games, rooms,
 message schema, permanent storage, or message interpretation.
 Applications define those concepts themselves.
 </p>
+<h2>JavaScript client: use an identifier</h2>
 
+<p>
+Load the client library and use any non-empty string as a communication
+space identifier. The library converts it to a URL automatically.
+</p>
+
+<pre>
+&lt;script src="/information-center.js"&gt;&lt;/script&gt;
+</pre>
+
+<pre>
+const center = new InformationCenter(
+  "https://infocenter-e7ok.onrender.com"
+);
+
+const id = "example.com's data";
+
+// Temporary RAM storage
+await center.mem(id, "Hello");
+console.log(await center.getText(id));
+
+// Realtime communication
+const ws = center.connect(id);
+
+ws.onopen = () => ws.send("Hello");
+
+ws.onmessage = event => {
+  console.log("Received:", event.data);
+};
+
+// HTTP broadcast to WebSocket clients
+await center.post(id, "Hello from HTTP");
+</pre>
+
+<p>
+Identifier mapping: UTF-8 → Base64URL without padding →
+/c/id/{encoded identifier}. Identifiers are not secrets.
+</p>
 <h2>Machine-readable specification</h2>
 
 <p>
