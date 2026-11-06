@@ -1,81 +1,146 @@
+"use strict";
+
 const express = require("express");
 const http = require("http");
+const crypto = require("crypto");
 const { WebSocketServer, WebSocket } = require("ws");
 
 const app = express();
 const server = http.createServer(app);
 
-// ---------------------------
-// Information Center V1
-// ---------------------------
+const PORT = Number(process.env.PORT) || 3000;
 
-const PORT = process.env.PORT || 3000;
+// 制限値
+const MAX_BODY_SIZE = 1024 * 1024;       // 1 MiB
+const MAX_MEMORY_TOTAL = 32 * 1024 * 1024; // MEM合計 32 MiB
+const MAX_SPACES = 5000;
+const MAX_IDENTIFIER_BYTES = 512;
+const MAX_KEY_BYTES = 512;
+const AUTH_TIMEOUT_MS = 5000;
+const MAX_WS_CLIENTS = 500;
+const MAX_WS_BUFFERED = 4 * 1024 * 1024;
 
-// 1メッセージ最大 1 MiB
-const MAX_BODY_SIZE = 1024 * 1024;
+// path + query → { keyHash: Buffer | null }
+// null はキーなしの公開空間。
+const spaces = new Map();
 
-// MEM用。
-// key: 通信空間
-// value: Buffer
+// path + query → Buffer
 const memory = new Map();
+let totalMemoryBytes = 0;
 
-// WebSocket
 const wss = new WebSocketServer({
   noServer: true,
   maxPayload: MAX_BODY_SIZE
 });
 
-
-// ---------------------------
-// Common
-// ---------------------------
+// --------------------------------------------------
+// 共通処理
+// --------------------------------------------------
 
 function spaceFromRequest(req) {
-  // URL全体ではなく、このサーバー内の path + query を空間IDとする。
-  //
-  // /c/game?a=1 と /c/game?a=2 は別空間。
-  //
-  // URL APIを使うことで多少正規化される点はV1仕様とする。
   const url = new URL(req.url, "http://information-center.local");
   return url.pathname + url.search;
 }
 
-function getRawBody(req, res, next) {
-  const chunks = [];
-  let size = 0;
-  let tooLarge = false;
-
-  req.on("data", (chunk) => {
-    if (tooLarge) return;
-
-    size += chunk.length;
-
-    if (size > MAX_BODY_SIZE) {
-      tooLarge = true;
-
-      res.status(413).json({
-        error: "BODY_TOO_LARGE",
-        maxBytes: MAX_BODY_SIZE
-      });
-
-      // 残りは読み捨てる
-      return;
-    }
-
-    chunks.push(chunk);
-  });
-
-  req.on("end", () => {
-    if (tooLarge) return;
-
-    req.rawBody = Buffer.concat(chunks);
-    next();
-  });
-
-  req.on("error", next);
+function isCommunicationPath(req) {
+  const url = new URL(req.url, "http://information-center.local");
+  return url.pathname === "/c" || url.pathname.startsWith("/c/");
 }
 
-function allowCors(req, res, next) {
+function pathForIdentifier(identifier) {
+  if (typeof identifier !== "string" || identifier.length === 0) {
+    throw new Error("Identifier must be a non-empty string");
+  }
+
+  const bytes = Buffer.from(identifier, "utf8");
+
+  if (bytes.length > MAX_IDENTIFIER_BYTES) {
+    throw new Error("Identifier is too long");
+  }
+
+  return "/c/id/" + bytes.toString("base64url");
+}
+
+function validateKey(key) {
+  return (
+    typeof key === "string" &&
+    key.length > 0 &&
+    Buffer.byteLength(key, "utf8") <= MAX_KEY_BYTES
+  );
+}
+
+function hashKey(key) {
+  return crypto.createHash("sha256").update(key, "utf8").digest();
+}
+
+function keyMatches(storedHash, candidate) {
+  if (!validateKey(candidate)) return false;
+
+  const candidateHash = hashKey(candidate);
+  return crypto.timingSafeEqual(storedHash, candidateHash);
+}
+
+function createPublicSpaceIfNeeded(space) {
+  if (spaces.has(space)) return true;
+  if (spaces.size >= MAX_SPACES) return false;
+
+  spaces.set(space, { keyHash: null });
+  return true;
+}
+
+function authorizeHttp(req, res) {
+  const space = spaceFromRequest(req);
+
+  if (!createPublicSpaceIfNeeded(space)) {
+    res.status(503).json({ error: "SPACE_LIMIT_REACHED" });
+    return null;
+  }
+
+  const record = spaces.get(space);
+
+  if (record.keyHash !== null) {
+    const key = req.get("X-Information-Center-Key");
+
+    if (!keyMatches(record.keyHash, key)) {
+      res.status(403).json({ error: "INVALID_KEY" });
+      return null;
+    }
+  }
+
+  return space;
+}
+
+function broadcast(space, data, isBinary, excludedClient = null) {
+  let delivered = 0;
+
+  for (const client of wss.clients) {
+    if (
+      client === excludedClient ||
+      client.readyState !== WebSocket.OPEN ||
+      !client.authenticated ||
+      client.space !== space
+    ) {
+      continue;
+    }
+
+    // 遅い接続に無制限にデータを溜めない。
+    if (client.bufferedAmount > MAX_WS_BUFFERED) {
+      client.close(1013, "Client too slow");
+      continue;
+    }
+
+    try {
+      client.send(data, { binary: isBinary });
+      delivered++;
+    } catch (error) {
+      console.error("Broadcast error:", error.message);
+    }
+  }
+
+  return delivered;
+}
+
+app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader(
     "Access-Control-Allow-Methods",
@@ -83,472 +148,427 @@ function allowCors(req, res, next) {
   );
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type"
+    "Content-Type, X-Information-Center-Key"
   );
+
+  // MEMは一時データなので、古いHTTPキャッシュを返さない。
+  res.setHeader("Cache-Control", "no-store");
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
   }
 
   next();
-}
-
-app.use(allowCors);
-// JavaScriptクライアントライブラリを配布
-app.get("/information-center.js", (req, res) => {
-  res.sendFile("information-center.js", {
-    root: __dirname
-  });
 });
 
-
-// ---------------------------
-// Documentation
-// ---------------------------
+// --------------------------------------------------
+// 説明書
+// --------------------------------------------------
 
 app.get("/", (req, res) => {
-  res.type("html").send(`
-<!DOCTYPE html>
-<html lang="en">
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="ja">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Information Center V1</title>
-
+<title>Information Center</title>
 <style>
-  body {
-    max-width: 900px;
-    margin: 40px auto;
-    padding: 0 20px 80px;
-    font-family: system-ui, sans-serif;
-    line-height: 1.6;
-    color: #202124;
-  }
-
-  code, pre {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-
-  pre {
-    padding: 16px;
-    overflow-x: auto;
-    background: #f4f5f6;
-    border-radius: 8px;
-  }
-
-  h1, h2 {
-    line-height: 1.25;
-  }
-
-  .notice {
-    padding: 14px;
-    border-left: 4px solid #e09b00;
-    background: #fff8e6;
-  }
+  body { max-width: 900px; margin: 40px auto; padding: 0 16px 60px;
+         font-family: system-ui, sans-serif; line-height: 1.6; }
+  pre { padding: 14px; background: #eee; overflow-x: auto; }
+  .warning { background: #fff4d6; padding: 14px; }
 </style>
 </head>
-
 <body>
-
-<h1>Information Center V1</h1>
-
-<p>
-This server is a generic, application-agnostic communication center.
-It does not know what your data means.
-Games, chat systems, websites, tools and other applications may define
-their own BODY format.
-</p>
-
-<h2>Core principle</h2>
-
-<pre>BODY IS OPAQUE.</pre>
+<h1>Information Center</h1>
 
 <p>
-The server does not require JSON, usernames, game IDs, room IDs,
-message types, coordinates, or any other application-specific structure.
-Bodies are handled as raw binary data whenever possible.
+汎用通信センターです。本文の形式や意味は解釈しません。
+識別子が同じクライアント同士で通信できます。
 </p>
 
-<h2>Conceptual protocol</h2>
+<h2>JavaScriptクライアント</h2>
 
-<pre>&lt;COMMAND&gt;&lt;URL&gt;BODY</pre>
-
-<p>There are four V1 commands:</p>
+<pre>&lt;script src="https://infocenter-e7ok.onrender.com/information-center.js"&gt;&lt;/script&gt;</pre>
 
 <pre>
-&lt;MEM&gt;        Store BODY temporarily in server RAM.
-&lt;DoGET&gt;      Retrieve the BODY currently stored at that URL.
-&lt;DoPOST&gt;     Broadcast BODY to WebSocket clients in the same space.
-&lt;WebSocket&gt; Connect to a space for realtime communication.
-</pre>
-
-<h2>HTTP mapping</h2>
-
-<pre>
-MEM:
-PUT /c/anything
-BODY
-
-DoGET:
-GET /c/anything
-
-DoPOST:
-POST /c/anything
-BODY
-
-WebSocket:
-ws(s)://HOST/c/anything
-</pre>
-
-<p>
-The path and query string identify the communication space.
-Applications are free to choose their own URL structure.
-</p>
-
-<pre>
-/c/chess
-/c/drawing
-/c/my-game?room=123
-/c/my-game?room=456
-</pre>
-
-<p>
-The server does not interpret words such as "game" or "room".
-They are simply parts of the URL.
-</p>
-
-<h2>MEM</h2>
-
-<pre>
-PUT /c/example
-
-Hello world
-</pre>
-
-<p>
-The body is stored in this server process's RAM.
-Writing to the same space again replaces the previous value.
-</p>
-
-<h2>DoGET</h2>
-
-<pre>
-GET /c/example
-</pre>
-
-<p>
-Returns the data previously stored with MEM.
-If no data exists, HTTP 404 is returned.
-</p>
-
-<h2>DoPOST</h2>
-
-<pre>
-POST /c/example
-
-Anything you want
-</pre>
-
-<p>
-The BODY is immediately broadcast to currently connected WebSocket
-clients in the exact same communication space.
-The BODY is not automatically stored by MEM.
-</p>
-
-<h2>WebSocket</h2>
-
-<pre>
-wss://HOST/c/example
-</pre>
-
-<p>
-A WebSocket client receives DoPOST messages sent to the same space.
-A message sent through the WebSocket is also broadcast to the other
-WebSocket clients in that space.
-</p>
-
-<h2>Example JavaScript</h2>
-
-<pre>
-const center = "https://YOUR-SERVER.onrender.com";
-const space = "/c/test";
-
-// MEM
-await fetch(center + space, {
-  method: "PUT",
-  body: "Temporary data"
-});
-
-// DoGET
-const response = await fetch(center + space);
-console.log(await response.text());
-
-// DoPOST
-await fetch(center + space, {
-  method: "POST",
-  body: "Hello everyone"
-});
-
-// WebSocket
-const ws = new WebSocket(
-  center.replace("https://", "wss://") + space
-);
-
-ws.onmessage = async event => {
-  if (event.data instanceof Blob) {
-    console.log(await event.data.text());
-  } else {
-    console.log(event.data);
-  }
-};
-
-ws.send("Realtime message");
-</pre>
-
-<h2>Important: MEM is volatile</h2>
-
-<div class="notice">
-MEM is not a database. Data exists only in the RAM of the current server
-process. It may disappear because of sleep, restart, deployment, crash,
-scaling, or infrastructure events. Never use MEM as permanent storage.
-</div>
-
-<h2>Limits</h2>
-
-<pre>
-Maximum BODY / WebSocket message size:
-${MAX_BODY_SIZE} bytes
-</pre>
-
-<p>
-V1 intentionally provides no application-level users, games, rooms,
-message schema, permanent storage, or message interpretation.
-Applications define those concepts themselves.
-</p>
-<h2>JavaScript client: use an identifier</h2>
-
-<p>
-Load the client library and use any non-empty string as a communication
-space identifier. The library converts it to a URL automatically.
-</p>
-
-<pre>
-&lt;script src="/information-center.js"&gt;&lt;/script&gt;
-</pre>
-
-<pre>
+// このサーバーに接続
 const center = new InformationCenter(
   "https://infocenter-e7ok.onrender.com"
 );
 
-const id = "example.com's data";
+// 識別子と任意のキー
+const id = "my-game-room";
+const key = "十分長いランダムな秘密キー";
 
-// Temporary RAM storage
-await center.mem(id, "Hello");
-console.log(await center.getText(id));
+// 初めて使う前に一度だけ登録。
+// 既に登録・使用済みなら失敗する。
+await center.register(id, key);
 
-// Realtime communication
-const ws = center.connect(id);
+// MEM: RAMに保存
+await center.mem(id, "保存する内容", key);
 
-ws.onopen = () => ws.send("Hello");
+// DoGET: MEMを読む。なければnull
+console.log(await center.getText(id, key));
 
-ws.onmessage = event => {
-  console.log("Received:", event.data);
+// WebSocket: 接続と認証が完了してから返る
+const ws = await center.connect(id, key);
+
+ws.onmessage = async event => {
+  const text = event.data instanceof Blob
+    ? await event.data.text()
+    : event.data;
+
+  console.log("受信:", text);
 };
 
-// HTTP broadcast to WebSocket clients
-await center.post(id, "Hello from HTTP");
+ws.send("こんにちは");
+
+// HTTP POSTからWebSocketへ配信
+await center.post(id, "HTTPからこんにちは", key);
 </pre>
 
 <p>
-Identifier mapping: UTF-8 → Base64URL without padding →
-/c/id/{encoded identifier}. Identifiers are not secrets.
+キーなしで使う場合は register を呼ばず、各メソッドの
+key 引数を省略してください。
 </p>
-<h2>Machine-readable specification</h2>
+
+<h2>識別子の変換規則</h2>
+
+<pre>UTF-8 → Base64URL（末尾の = なし）→ /c/id/{結果}</pre>
 
 <p>
-<a href="/spec">/spec</a>
+文字列は正確に一致させてください。大文字・小文字、空白、
+Unicodeの表現の違いも区別します。
 </p>
 
-<h2>Health check</h2>
+<h2>HTTP API</h2>
+
+<pre>
+POST /register
+  JSON: {"identifier":"識別子","key":"秘密キー"}
+  新しいキー付き空間を登録。成功: 201、使用済み: 409
+
+PUT /c/...   MEMを上書き保存
+GET /c/...   MEMを取得。存在しなければ404
+POST /c/...  接続中のWebSocketへ配信
+
+キー付き空間へのHTTP通信:
+  X-Information-Center-Key ヘッダーにキーを指定
+</pre>
+
+<h2>WebSocket API</h2>
+
+<pre>
+公開空間:
+  wss://HOST/c/... に接続するだけ
+
+キー付き空間:
+  接続後、最初の5秒以内に次のJSONテキストを送信:
+  {"type":"auth","key":"秘密キー"}
+
+  サーバーが {"type":"auth_ok"} を返せば認証成功。
+  以降のメッセージは同じ空間の他の接続へ転送。
+</pre>
 
 <p>
-<a href="/health">/health</a>
+HTTP POSTの本文はWebSocketへバイナリとして配信されます。
+WebSocketからの送信は元のテキスト／バイナリ種別を維持します。
+送信元WebSocketには自分のメッセージは返りません。
 </p>
 
+<div class="warning">
+<strong>注意：</strong>
+登録情報とMEMはRAMのみです。スリープ、再起動、
+再デプロイ等で消えます。再起動後は他者が先に識別子を
+取得できる可能性があります。センターは本文を読めるため、
+センターからも隠したい場合はクライアント側で別途暗号化してください。
+キーを公開HTMLに埋め込むと閲覧者にも見えます。
+</div>
+
+<h2>V1互換</h2>
+<p>
+キーなし空間では、従来どおり /c/... に直接アクセスできます。
+ただし、先に公開空間として使われたURLは、再起動まで
+キー付きとして登録できません。
+</p>
+
+<p>
+<a href="/spec">機械可読仕様 /spec</a> |
+<a href="/health">稼働状況 /health</a> |
+<a href="/information-center.js">クライアントライブラリ</a>
+</p>
 </body>
-</html>
-  `);
+</html>`);
 });
 
 app.get("/spec", (req, res) => {
   res.json({
     name: "Information Center",
-    version: "1.0",
-    philosophy: "BODY IS OPAQUE",
-    conceptualProtocol: "<COMMAND><URL>BODY",
-
-    commands: {
-      MEM: {
-        transport: "HTTP",
-        method: "PUT",
-        behavior: "Replace volatile RAM value for the requested space"
+    version: "2.0-ram-key",
+    bodyPolicy: "opaque bytes",
+    identifierMapping: "UTF-8 -> Base64URL without padding -> /c/id/{encoded}",
+    clientLibrary: "/information-center.js",
+    registration: {
+      method: "POST",
+      path: "/register",
+      json: { identifier: "non-empty string", key: "non-empty string" },
+      success: 201,
+      alreadyUsed: 409,
+      storage: "volatile process RAM"
+    },
+    http: {
+      mem: "PUT /c/...",
+      get: "GET /c/...",
+      post: "POST /c/...",
+      keyHeader: "X-Information-Center-Key"
+    },
+    websocket: {
+      path: "/c/...",
+      protectedAuth: {
+        firstMessage: { type: "auth", key: "secret" },
+        success: { type: "auth_ok" },
+        timeoutMs: AUTH_TIMEOUT_MS
       },
-
-      DoGET: {
-        transport: "HTTP",
-        method: "GET",
-        behavior: "Return current volatile RAM value"
-      },
-
-      DoPOST: {
-        transport: "HTTP",
-        method: "POST",
-        behavior: "Broadcast BODY to WebSocket clients in the same space"
-      },
-
-      WebSocket: {
-        transport: "WebSocket",
-        behavior:
-          "Receive broadcasts and broadcast WebSocket messages to peers in the same space"
-      }
+      senderReceivesOwnMessage: false
     },
-
-    space: {
-      identity: "URL path and query string",
-      applicationDefined: true
-    },
-
-    body: {
-      format: "opaque binary",
-      maxBytes: MAX_BODY_SIZE
-    },
-
-    memory: {
-      type: "process RAM",
-      persistent: false,
-      deletionCommand: false,
-      sameSpaceWritesReplacePreviousValue: true
-    },
-
     warnings: [
-      "MEM can disappear at any time.",
-      "DoPOST is not stored automatically.",
-      "V1 does not interpret application data.",
-      "V1 does not provide authentication."
-    ]
+      "Registration and MEM may disappear on sleep, restart, or deployment.",
+      "Register protected identifiers before first use.",
+      "The server can read bodies and keys.",
+      "A shared key grants both read and write access.",
+      "Public identifiers can be used by anyone.",
+      "This implementation is for a single server instance."
+    ],
+    limits: {
+      maxBodyBytes: MAX_BODY_SIZE,
+      maxMemoryBytes: MAX_MEMORY_TOTAL,
+      maxSpaces: MAX_SPACES,
+      maxIdentifierBytes: MAX_IDENTIFIER_BYTES,
+      maxKeyBytes: MAX_KEY_BYTES,
+      maxWebSocketClients: MAX_WS_CLIENTS
+    }
   });
 });
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "1.0",
+    version: "2.0-ram-key",
+    spaces: spaces.size,
     memoryEntries: memory.size,
+    memoryBytes: totalMemoryBytes,
     websocketClients: wss.clients.size,
     uptimeSeconds: Math.floor(process.uptime())
   });
 });
 
+app.get("/information-center.js", (req, res) => {
+  res.sendFile("information-center.js", { root: __dirname });
+});
 
-// ---------------------------
-// Communication endpoints
-// Everything under /c/*
-// ---------------------------
+// --------------------------------------------------
+// キー付き識別子の登録
+// --------------------------------------------------
+
+app.post(
+  "/register",
+  express.json({ limit: "8kb" }),
+  (req, res) => {
+    let space;
+
+    try {
+      space = pathForIdentifier(req.body?.identifier);
+    } catch (error) {
+      return res.status(400).json({
+        error: "INVALID_IDENTIFIER",
+        message: error.message
+      });
+    }
+
+    const key = req.body?.key;
+
+    if (!validateKey(key)) {
+      return res.status(400).json({
+        error: "INVALID_KEY",
+        message: "Key must be a non-empty string within 512 UTF-8 bytes"
+      });
+    }
+
+    // 登録判定とセットは同期処理なので、このプロセス内では
+    // 途中に他リクエストが割り込まない。
+    if (spaces.has(space)) {
+      return res.status(409).json({
+        error: "SPACE_ALREADY_USED"
+      });
+    }
+
+    if (spaces.size >= MAX_SPACES) {
+      return res.status(503).json({
+        error: "SPACE_LIMIT_REACHED"
+      });
+    }
+
+    spaces.set(space, { keyHash: hashKey(key) });
+
+    return res.status(201).json({
+      ok: true,
+      space
+    });
+  }
+);
+
+// --------------------------------------------------
+// HTTP通信
+// --------------------------------------------------
+
+const rawBody = express.raw({
+  type: () => true,
+  limit: MAX_BODY_SIZE
+});
+
+// 認証後に本文を読み取る。
+app.use((req, res, next) => {
+  if (!isCommunicationPath(req)) return next();
+
+  if (!["GET", "PUT", "POST"].includes(req.method)) {
+    return res.status(405).json({ error: "METHOD_NOT_ALLOWED" });
+  }
+
+  const space = authorizeHttp(req, res);
+  if (space === null) return;
+
+  req.communicationSpace = space;
+  next();
+});
 
 // MEM
-app.put(/^\/c(?:\/.*)?$/, getRawBody, (req, res) => {
-  const space = spaceFromRequest(req);
+app.put(/^\/c(?:\/.*)?$/, rawBody, (req, res) => {
+  const space = req.communicationSpace;
+  const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
 
-  // Bufferとして保存する。
-  memory.set(space, Buffer.from(req.rawBody));
+  const previous = memory.get(space);
+  const previousSize = previous ? previous.length : 0;
+  const nextTotal = totalMemoryBytes - previousSize + body.length;
+
+  if (nextTotal > MAX_MEMORY_TOTAL) {
+    return res.status(503).json({ error: "MEMORY_LIMIT_REACHED" });
+  }
+
+  memory.set(space, Buffer.from(body));
+  totalMemoryBytes = nextTotal;
 
   res.status(204).end();
 });
 
-
 // DoGET
 app.get(/^\/c(?:\/.*)?$/, (req, res) => {
-  const space = spaceFromRequest(req);
-
-  const data = memory.get(space);
+  const data = memory.get(req.communicationSpace);
 
   if (data === undefined) {
-    return res.status(404).json({
-      error: "NO_MEMORY",
-      space
-    });
+    return res.status(404).json({ error: "NO_MEMORY" });
   }
 
-  res.setHeader("Content-Type", "application/octet-stream");
-  res.send(data);
+  res.type("application/octet-stream").send(data);
 });
-
 
 // DoPOST
-app.post(/^\/c(?:\/.*)?$/, getRawBody, (req, res) => {
-  const space = spaceFromRequest(req);
-  const body = req.rawBody;
+app.post(/^\/c(?:\/.*)?$/, rawBody, (req, res) => {
+  const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
 
-  let delivered = 0;
+  const delivered = broadcast(
+    req.communicationSpace,
+    body,
+    true
+  );
 
-  for (const client of wss.clients) {
-    if (
-      client.readyState === WebSocket.OPEN &&
-      client.space === space
-    ) {
-      client.send(body, { binary: true });
-      delivered++;
-    }
-  }
-
-  res.json({
-    ok: true,
-    delivered
-  });
+  res.json({ ok: true, delivered });
 });
 
-
-// ---------------------------
+// --------------------------------------------------
 // WebSocket
-// ---------------------------
+// --------------------------------------------------
 
 server.on("upgrade", (req, socket, head) => {
-  const space = spaceFromRequest(req);
-
-  // V1では /c 以下だけをWebSocket通信空間にする。
-  if (!space.startsWith("/c/") && space !== "/c") {
-    socket.write(
-      "HTTP/1.1 404 Not Found\\r\\n" +
-      "Connection: close\\r\\n" +
-      "\\r\\n"
-    );
-
+  if (!isCommunicationPath(req)) {
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
   }
 
+  if (wss.clients.size >= MAX_WS_CLIENTS) {
+    socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const space = spaceFromRequest(req);
+
+  if (!createPublicSpaceIfNeeded(space)) {
+    socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const record = spaces.get(space);
+
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.space = space;
+    ws.authenticated = record.keyHash === null;
+    ws.keyHash = record.keyHash;
+
     wss.emit("connection", ws, req);
   });
 });
 
-
 wss.on("connection", (ws) => {
-  ws.on("message", (data, isBinary) => {
-    // WebSocketから届いたデータも、
-    // 同じ通信空間の他クライアントへそのまま送る。
+  let authTimer = null;
 
-    for (const client of wss.clients) {
-      if (
-        client !== ws &&
-        client.readyState === WebSocket.OPEN &&
-        client.space === ws.space
-      ) {
-        client.send(data, { binary: isBinary });
+  if (!ws.authenticated) {
+    authTimer = setTimeout(() => {
+      if (!ws.authenticated) {
+        ws.close(1008, "Authentication timeout");
       }
+    }, AUTH_TIMEOUT_MS);
+  }
+
+  ws.on("message", (data, isBinary) => {
+    if (!ws.authenticated) {
+      // 最初のメッセージは認証専用。
+      if (isBinary || data.length > 4096) {
+        ws.close(1008, "Invalid authentication");
+        return;
+      }
+
+      let message;
+
+      try {
+        message = JSON.parse(data.toString("utf8"));
+      } catch {
+        ws.close(1008, "Invalid authentication");
+        return;
+      }
+
+      if (
+        message?.type !== "auth" ||
+        !keyMatches(ws.keyHash, message.key)
+      ) {
+        ws.close(1008, "Invalid authentication");
+        return;
+      }
+
+      ws.authenticated = true;
+      clearTimeout(authTimer);
+
+      ws.send(JSON.stringify({ type: "auth_ok" }));
+      return;
     }
+
+    broadcast(ws.space, data, isBinary, ws);
+  });
+
+  ws.on("close", () => {
+    if (authTimer) clearTimeout(authTimer);
   });
 
   ws.on("error", (error) => {
@@ -556,28 +576,25 @@ wss.on("connection", (ws) => {
   });
 });
 
-
-// ---------------------------
-// Error handling
-// ---------------------------
+// --------------------------------------------------
+// エラー処理
+// --------------------------------------------------
 
 app.use((err, req, res, next) => {
-  console.error(err);
+  if (res.headersSent) return next(err);
 
-  if (res.headersSent) {
-    return next(err);
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({ error: "BODY_TOO_LARGE" });
   }
 
-  res.status(500).json({
-    error: "INTERNAL_SERVER_ERROR"
-  });
+  if (err.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "INVALID_JSON" });
+  }
+
+  console.error(err);
+  res.status(500).json({ error: "INTERNAL_SERVER_ERROR" });
 });
 
-
-// ---------------------------
-// Start
-// ---------------------------
-
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Information Center V1 running on port ${PORT}`);
+  console.log(`Information Center running on port ${PORT}`);
 });
