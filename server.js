@@ -90,11 +90,41 @@ function createPublicSpaceIfNeeded(space) {
 
 function authorizeHttp(req, res) {
   const space = spaceFromRequest(req);
+  const key = req.get("X-Information-Center-Key");
+  let record = spaces.get(space);
 
-  if (!createPublicSpaceIfNeeded(space)) {
-    res.status(503).json({ error: "SPACE_LIMIT_REACHED" });
-    return null;
+  // キーを持っているのに登録がない場合は、
+  // 公開空間を作らず拒否する。
+  if (!record) {
+    if (key !== undefined) {
+      res.status(403).json({ error: "PROTECTED_SPACE_NOT_REGISTERED" });
+      return null;
+    }
+
+    if (!createPublicSpaceIfNeeded(space)) {
+      res.status(503).json({ error: "SPACE_LIMIT_REACHED" });
+      return null;
+    }
+
+    record = spaces.get(space);
   }
+
+  if (record.keyHash === null) {
+    // キー付きで使うつもりのクライアントを、
+    // 意図せず公開空間に入れない。
+    if (key !== undefined) {
+      res.status(403).json({ error: "SPACE_IS_PUBLIC" });
+      return null;
+    }
+  } else {
+    if (!keyMatches(record.keyHash, key)) {
+      res.status(403).json({ error: "INVALID_KEY" });
+      return null;
+    }
+  }
+
+  return space;
+}
 
   const record = spaces.get(space);
 
@@ -490,31 +520,60 @@ app.post(/^\/c(?:\/.*)?$/, rawBody, (req, res) => {
 // --------------------------------------------------
 
 server.on("upgrade", (req, socket, head) => {
-  if (!isCommunicationPath(req)) {
-    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+  function rejectUpgrade(status, reason) {
+    socket.write(
+      `HTTP/1.1 ${status} ${reason}\r\n` +
+      "Connection: close\r\n\r\n"
+    );
     socket.destroy();
+  }
+
+  if (!isCommunicationPath(req)) {
+    rejectUpgrade(404, "Not Found");
     return;
   }
 
   if (wss.clients.size >= MAX_WS_CLIENTS) {
-    socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
-    socket.destroy();
+    rejectUpgrade(503, "Service Unavailable");
     return;
   }
 
+  // このマーカーは秘密キーではない。
+  // 「キー付き空間に接続したい」という意思表示。
+  const protocols = (req.headers["sec-websocket-protocol"] || "")
+    .split(",")
+    .map(value => value.trim());
+
+  const wantsProtected = protocols.includes("ic-key-v2");
   const space = spaceFromRequest(req);
+  let record = spaces.get(space);
 
-  if (!createPublicSpaceIfNeeded(space)) {
-    socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
-    socket.destroy();
-    return;
+  if (!record) {
+    if (wantsProtected) {
+      // 登録が消えていた場合、公開空間にフォールバックしない。
+      rejectUpgrade(403, "Protected Space Not Registered");
+      return;
+    }
+
+    if (!createPublicSpaceIfNeeded(space)) {
+      rejectUpgrade(503, "Service Unavailable");
+      return;
+    }
+
+    record = spaces.get(space);
   }
 
-  const record = spaces.get(space);
+  const isProtected = record.keyHash !== null;
+
+  // 接続したい種類と、実際の空間の種類が違えば拒否。
+  if (wantsProtected !== isProtected) {
+    rejectUpgrade(403, "Space Type Mismatch");
+    return;
+  }
 
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.space = space;
-    ws.authenticated = record.keyHash === null;
+    ws.authenticated = !isProtected;
     ws.keyHash = record.keyHash;
 
     wss.emit("connection", ws, req);
