@@ -94,6 +94,12 @@ function allowCors(req, res, next) {
 }
 
 app.use(allowCors);
+// JavaScriptクライアントライブラリを配布
+app.get("/information-center.js", (req, res) => {
+  res.sendFile("information-center.js", {
+    root: __dirname
+  });
+});
 
 
 // ---------------------------
